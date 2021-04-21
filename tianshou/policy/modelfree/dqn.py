@@ -1,24 +1,29 @@
 import torch
 import numpy as np
 from copy import deepcopy
-import torch.nn.functional as F
-from typing import Dict, Union, Optional
+from typing import Any, Dict, Union, Optional
 
 from tianshou.policy import BasePolicy
-from tianshou.data import Batch, ReplayBuffer, PrioritizedReplayBuffer
+from tianshou.data import Batch, ReplayBuffer, to_torch_as, to_numpy
 
 
 class DQNPolicy(BasePolicy):
-    """Implementation of Deep Q Network. arXiv:1312.5602
+    """Implementation of Deep Q Network. arXiv:1312.5602.
+
+    Implementation of Double Q-Learning. arXiv:1509.06461.
+
+    Implementation of Dueling DQN. arXiv:1511.06581 (the dueling DQN is
+    implemented in the network side, not here).
 
     :param torch.nn.Module model: a model following the rules in
         :class:`~tianshou.policy.BasePolicy`. (s -> logits)
     :param torch.optim.Optimizer optim: a torch.optim for optimizing the model.
     :param float discount_factor: in [0, 1].
-    :param int estimation_step: greater than 1, the number of steps to look
-        ahead.
-    :param int target_update_freq: the target network update frequency (``0``
-        if you do not use the target network).
+    :param int estimation_step: the number of steps to look ahead. Default to 1.
+    :param int target_update_freq: the target network update frequency (0 if
+        you do not use the target network). Default to 0.
+    :param bool reward_normalization: normalize the reward to Normal(0, 1).
+        Default to False.
 
     .. seealso::
 
@@ -26,109 +31,103 @@ class DQNPolicy(BasePolicy):
         explanation.
     """
 
-    def __init__(self,
-                 model: torch.nn.Module,
-                 optim: torch.optim.Optimizer,
-                 discount_factor: float = 0.99,
-                 estimation_step: int = 1,
-                 target_update_freq: Optional[int] = 0,
-                 **kwargs) -> None:
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        optim: torch.optim.Optimizer,
+        discount_factor: float = 0.99,
+        estimation_step: int = 1,
+        target_update_freq: int = 0,
+        reward_normalization: bool = False,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
         self.model = model
         self.optim = optim
-        self.eps = 0
-        assert 0 <= discount_factor <= 1, 'discount_factor should in [0, 1]'
+        self.eps = 0.0
+        assert 0.0 <= discount_factor <= 1.0, "discount factor should be in [0, 1]"
         self._gamma = discount_factor
-        assert estimation_step > 0, 'estimation_step should greater than 0'
+        assert estimation_step > 0, "estimation_step should be greater than 0"
         self._n_step = estimation_step
         self._target = target_update_freq > 0
         self._freq = target_update_freq
-        self._cnt = 0
+        self._iter = 0
         if self._target:
             self.model_old = deepcopy(self.model)
             self.model_old.eval()
+        self._rew_norm = reward_normalization
 
     def set_eps(self, eps: float) -> None:
         """Set the eps for epsilon-greedy exploration."""
         self.eps = eps
 
-    def train(self) -> None:
+    def train(self, mode: bool = True) -> "DQNPolicy":
         """Set the module in training mode, except for the target network."""
-        self.training = True
-        self.model.train()
-
-    def eval(self) -> None:
-        """Set the module in evaluation mode, except for the target network."""
-        self.training = False
-        self.model.eval()
+        self.training = mode
+        self.model.train(mode)
+        return self
 
     def sync_weight(self) -> None:
         """Synchronize the weight for the target network."""
-        self.model_old.load_state_dict(self.model.state_dict())
+        self.model_old.load_state_dict(self.model.state_dict())  # type: ignore
 
-    def process_fn(self, batch: Batch, buffer: ReplayBuffer,
-                   indice: np.ndarray) -> Batch:
-        r"""Compute the n-step return for Q-learning targets:
-
-        .. math::
-            G_t = \sum_{i = t}^{t + n - 1} \gamma^{i - t}(1 - d_i)r_i +
-            \gamma^n (1 - d_{t + n}) \max_a Q_{old}(s_{t + n}, \arg\max_a
-            (Q_{new}(s_{t + n}, a)))
-
-        , where :math:`\gamma` is the discount factor,
-        :math:`\gamma \in [0, 1]`, :math:`d_t` is the done flag of step
-        :math:`t`. If there is no target network, the :math:`Q_{old}` is equal
-        to :math:`Q_{new}`.
-        """
-        returns = np.zeros_like(indice)
-        gammas = np.zeros_like(indice) + self._n_step
-        for n in range(self._n_step - 1, -1, -1):
-            now = (indice + n) % len(buffer)
-            gammas[buffer.done[now] > 0] = n
-            returns[buffer.done[now] > 0] = 0
-            returns = buffer.rew[now] + self._gamma * returns
-        terminal = (indice + self._n_step - 1) % len(buffer)
-        terminal_data = buffer[terminal]
+    def _target_q(self, buffer: ReplayBuffer, indice: np.ndarray) -> torch.Tensor:
+        batch = buffer[indice]  # batch.obs_next: s_{t+n}
+        result = self(batch, input="obs_next")
         if self._target:
             # target_Q = Q_old(s_, argmax(Q_new(s_, *)))
-            a = self(terminal_data, input='obs_next', eps=0).act
-            target_q = self(
-                terminal_data, model='model_old', input='obs_next').logits
-            if isinstance(target_q, torch.Tensor):
-                target_q = target_q.detach().cpu().numpy()
-            target_q = target_q[np.arange(len(a)), a]
+            target_q = self(batch, model="model_old", input="obs_next").logits
         else:
-            target_q = self(terminal_data, input='obs_next').logits
-            if isinstance(target_q, torch.Tensor):
-                target_q = target_q.detach().cpu().numpy()
-            target_q = target_q.max(axis=1)
-        target_q[gammas != self._n_step] = 0
-        returns += (self._gamma ** gammas) * target_q
-        batch.returns = returns
-        if isinstance(buffer, PrioritizedReplayBuffer):
-            q = self(batch).logits
-            q = q[np.arange(len(q)), batch.act]
-            r = batch.returns
-            if isinstance(r, np.ndarray):
-                r = torch.tensor(r, device=q.device, dtype=q.dtype)
-            td = r - q
-            buffer.update_weight(indice, td.detach().cpu().numpy())
-            impt_weight = torch.tensor(batch.impt_weight,
-                                       device=q.device, dtype=torch.float)
-            loss = (td.pow(2) * impt_weight).mean()
-            if not hasattr(batch, 'loss'):
-                batch.loss = loss
-            else:
-                batch.loss += loss
+            target_q = result.logits
+        target_q = target_q[np.arange(len(result.act)), result.act]
+        return target_q
+
+    def process_fn(
+        self, batch: Batch, buffer: ReplayBuffer, indice: np.ndarray
+    ) -> Batch:
+        """Compute the n-step return for Q-learning targets.
+
+        More details can be found at
+        :meth:`~tianshou.policy.BasePolicy.compute_nstep_return`.
+        """
+        batch = self.compute_nstep_return(
+            batch, buffer, indice, self._target_q,
+            self._gamma, self._n_step, self._rew_norm)
         return batch
 
-    def forward(self, batch: Batch,
-                state: Optional[Union[dict, Batch, np.ndarray]] = None,
-                model: str = 'model',
-                input: str = 'obs',
-                eps: Optional[float] = None,
-                **kwargs) -> Batch:
+    def compute_q_value(
+        self, logits: torch.Tensor, mask: Optional[np.ndarray]
+    ) -> torch.Tensor:
+        """Compute the q value based on the network's raw output and action mask."""
+        if mask is not None:
+            # the masked q value should be smaller than logits.min()
+            min_value = logits.min() - logits.max() - 1.0
+            logits = logits + to_torch_as(1 - mask, logits) * min_value
+        return logits
+
+    def forward(
+        self,
+        batch: Batch,
+        state: Optional[Union[dict, Batch, np.ndarray]] = None,
+        model: str = "model",
+        input: str = "obs",
+        **kwargs: Any,
+    ) -> Batch:
         """Compute action over the given batch data.
+
+        If you need to mask the action, please add a "mask" into batch.obs, for
+        example, if we have an environment that has "0/1/2" three actions:
+        ::
+
+            batch == Batch(
+                obs=Batch(
+                    obs="original obs, with batch_size=1 for demonstration",
+                    mask=np.array([[False, True, False]]),
+                    # action 1 is available
+                    # action 0 and 2 are unavailable
+                ),
+                ...
+            )
 
         :param float eps: in [0, 1], for epsilon-greedy exploration method.
 
@@ -144,32 +143,40 @@ class DQNPolicy(BasePolicy):
             more detailed explanation.
         """
         model = getattr(self, model)
-        obs = getattr(batch, input)
-        q, h = model(obs, state=state, info=batch.info)
-        act = q.max(dim=1)[1].detach().cpu().numpy()
-        # add eps to act
-        if eps is None:
-            eps = self.eps
-        if not np.isclose(eps, 0):
-            for i in range(len(q)):
-                if np.random.rand() < eps:
-                    act[i] = np.random.randint(q.shape[1])
-        return Batch(logits=q, act=act, state=h)
+        obs = batch[input]
+        obs_ = obs.obs if hasattr(obs, "obs") else obs
+        logits, h = model(obs_, state=state, info=batch.info)
+        q = self.compute_q_value(logits, getattr(obs, "mask", None))
+        if not hasattr(self, "max_action_num"):
+            self.max_action_num = q.shape[1]
+        act = to_numpy(q.max(dim=1)[1])
+        return Batch(logits=logits, act=act, state=h)
 
-    def learn(self, batch: Batch, **kwargs) -> Dict[str, float]:
-        if self._target and self._cnt % self._freq == 0:
+    def learn(self, batch: Batch, **kwargs: Any) -> Dict[str, float]:
+        if self._target and self._iter % self._freq == 0:
             self.sync_weight()
         self.optim.zero_grad()
-        if hasattr(batch, 'loss'):
-            loss = batch.loss
-        else:
-            q = self(batch).logits
-            q = q[np.arange(len(q)), batch.act]
-            r = batch.returns
-            if isinstance(r, np.ndarray):
-                r = torch.tensor(r, device=q.device, dtype=q.dtype)
-            loss = F.mse_loss(q, r)
+        weight = batch.pop("weight", 1.0)
+        q = self(batch).logits
+        q = q[np.arange(len(q)), batch.act]
+        r = to_torch_as(batch.returns.flatten(), q)
+        td = r - q
+        loss = (td.pow(2) * weight).mean()
+        batch.weight = td  # prio-buffer
         loss.backward()
         self.optim.step()
-        self._cnt += 1
-        return {'loss': loss.item()}
+        self._iter += 1
+        return {"loss": loss.item()}
+
+    def exploration_noise(
+        self, act: Union[np.ndarray, Batch], batch: Batch
+    ) -> Union[np.ndarray, Batch]:
+        if isinstance(act, np.ndarray) and not np.isclose(self.eps, 0.0):
+            bsz = len(act)
+            rand_mask = np.random.rand(bsz) < self.eps
+            q = np.random.rand(bsz, self.max_action_num)  # [0, 1]
+            if hasattr(batch.obs, "mask"):
+                q += batch.obs.mask
+            rand_act = q.argmax(axis=1)
+            act[rand_mask] = rand_act[rand_mask]
+        return act

@@ -26,27 +26,40 @@ CartPole-v0 is a simple environment with a discrete action space, for which DQN 
 Setup Multi-environment Wrapper
 -------------------------------
 
-It is available if you want the original ``gym.Env``: 
+If you want to use the original ``gym.Env``:
 ::
 
     train_envs = gym.make('CartPole-v0')
     test_envs = gym.make('CartPole-v0')
 
-Tianshou supports parallel sampling for all algorithms. It provides three types of vectorized environment wrapper: :class:`~tianshou.env.VectorEnv`, :class:`~tianshou.env.SubprocVectorEnv`, and :class:`~tianshou.env.RayVectorEnv`. It can be used as follows: 
+Tianshou supports parallel sampling for all algorithms. It provides four types of vectorized environment wrapper: :class:`~tianshou.env.DummyVectorEnv`, :class:`~tianshou.env.SubprocVectorEnv`, :class:`~tianshou.env.ShmemVectorEnv`, and :class:`~tianshou.env.RayVectorEnv`. It can be used as follows: (more explanation can be found at :ref:`parallel_sampling`)
 ::
 
-    train_envs = ts.env.VectorEnv([lambda: gym.make('CartPole-v0') for _ in range(8)])
-    test_envs = ts.env.VectorEnv([lambda: gym.make('CartPole-v0') for _ in range(100)])
+    train_envs = ts.env.DummyVectorEnv([lambda: gym.make('CartPole-v0') for _ in range(10)])
+    test_envs = ts.env.DummyVectorEnv([lambda: gym.make('CartPole-v0') for _ in range(100)])
 
-Here, we set up 8 environments in ``train_envs`` and 100 environments in ``test_envs``.
+Here, we set up 10 environments in ``train_envs`` and 100 environments in ``test_envs``.
 
-For the demonstration, here we use the second block of codes.
+For the demonstration, here we use the second code-block.
 
+.. warning::
+
+    If you use your own environment, please make sure the ``seed`` method is set up properly, e.g.,
+
+    ::
+
+        def seed(self, seed):
+            np.random.seed(seed)
+
+    Otherwise, the outputs of these envs may be the same with each other.
+
+
+.. _build_the_network:
 
 Build the Network
 -----------------
 
-Tianshou supports any user-defined PyTorch networks and optimizers but with the limitation of input and output API. Here is an example code: 
+Tianshou supports any user-defined PyTorch networks and optimizers. Yet, of course, the inputs and outputs must comply with Tianshou's API. Here is an example:
 ::
 
     import torch, numpy as np
@@ -55,12 +68,13 @@ Tianshou supports any user-defined PyTorch networks and optimizers but with the 
     class Net(nn.Module):
         def __init__(self, state_shape, action_shape):
             super().__init__()
-            self.model = nn.Sequential(*[
+            self.model = nn.Sequential(
                 nn.Linear(np.prod(state_shape), 128), nn.ReLU(inplace=True),
                 nn.Linear(128, 128), nn.ReLU(inplace=True),
                 nn.Linear(128, 128), nn.ReLU(inplace=True),
-                nn.Linear(128, np.prod(action_shape))
-            ])
+                nn.Linear(128, np.prod(action_shape)),
+            )
+
         def forward(self, obs, state=None, info={}):
             if not isinstance(obs, torch.Tensor):
                 obs = torch.tensor(obs, dtype=torch.float)
@@ -73,69 +87,72 @@ Tianshou supports any user-defined PyTorch networks and optimizers but with the 
     net = Net(state_shape, action_shape)
     optim = torch.optim.Adam(net.parameters(), lr=1e-3)
 
-The rules of self-defined networks are:
+You can also use pre-defined MLP networks in :mod:`~tianshou.utils.net.common`, :mod:`~tianshou.utils.net.discrete`, and :mod:`~tianshou.utils.net.continuous`. The rules of self-defined networks are:
 
-1. Input: observation ``obs`` (may be a ``numpy.ndarray`` or ``torch.Tensor``), hidden state ``state`` (for RNN usage), and other information ``info`` provided by the environment.
-2. Output: some ``logits`` and the next hidden state ``state``. The logits could be a tuple instead of a ``torch.Tensor``. It depends on how the policy process the network output. For example, in PPO :cite:`PPO`, the return of the network might be ``(mu, sigma), state`` for Gaussian policy.
+1. Input: observation ``obs`` (may be a ``numpy.ndarray``, ``torch.Tensor``, dict, or self-defined class), hidden state ``state`` (for RNN usage), and other information ``info`` provided by the environment.
+2. Output: some ``logits``, the next hidden state ``state``. The logits could be a tuple instead of a ``torch.Tensor``, or some other useful variables or results during the policy forwarding procedure. It depends on how the policy class process the network output. For example, in PPO :cite:`PPO`, the return of the network might be ``(mu, sigma), state`` for Gaussian policy.
+
+.. note::
+
+    The logits here indicates the raw output of the network. In supervised learning, the raw output of prediction/classification model is called logits, and here we extend this definition to any raw output of the neural network.
 
 
 Setup Policy
 ------------
 
-We use the defined ``net`` and ``optim``, with extra policy hyper-parameters, to define a policy. Here we define a DQN policy with using a target network: 
+We use the defined ``net`` and ``optim`` above, with extra policy hyper-parameters, to define a policy. Here we define a DQN policy with a target network:
 ::
 
-    policy = ts.policy.DQNPolicy(net, optim,
-        discount_factor=0.9, estimation_step=3,
-        use_target_network=True, target_update_freq=320)
+    policy = ts.policy.DQNPolicy(net, optim, discount_factor=0.9, estimation_step=3, target_update_freq=320)
 
 
 Setup Collector
 ---------------
 
-The collector is a key concept in Tianshou. It allows the policy to interact with different types of environments conveniently. 
+The collector is a key concept in Tianshou. It allows the policy to interact with different types of environments conveniently.
 In each step, the collector will let the policy perform (at least) a specified number of steps or episodes and store the data in a replay buffer.
 ::
 
-    train_collector = ts.data.Collector(policy, train_envs, ts.data.ReplayBuffer(size=20000))
-    test_collector = ts.data.Collector(policy, test_envs)
+    train_collector = ts.data.Collector(policy, train_envs, ts.data.VectorReplayBuffer(20000, 10), exploration_noise=True)
+    test_collector = ts.data.Collector(policy, test_envs, exploration_noise=True)
 
 
 Train Policy with a Trainer
 ---------------------------
 
-Tianshou provides :class:`~tianshou.trainer.onpolicy_trainer` and :class:`~tianshou.trainer.offpolicy_trainer`. The trainer will automatically stop training when the policy reach the stop condition ``stop_fn`` on test collector. Since DQN is an off-policy algorithm, we use the :class:`~tianshou.trainer.offpolicy_trainer` as follows:
+Tianshou provides :func:`~tianshou.trainer.onpolicy_trainer`, :func:`~tianshou.trainer.offpolicy_trainer`, and :func:`~tianshou.trainer.offline_trainer`. The trainer will automatically stop training when the policy reach the stop condition ``stop_fn`` on test collector. Since DQN is an off-policy algorithm, we use the :func:`~tianshou.trainer.offpolicy_trainer` as follows:
 ::
 
     result = ts.trainer.offpolicy_trainer(
         policy, train_collector, test_collector,
-        max_epoch=10, step_per_epoch=1000, collect_per_step=10,
-        episode_per_test=100, batch_size=64,
-        train_fn=lambda e: policy.set_eps(0.1),
-        test_fn=lambda e: policy.set_eps(0.05),
-        stop_fn=lambda x: x >= env.spec.reward_threshold,
-        writer=None)
+        max_epoch=10, step_per_epoch=10000, step_per_collect=10,
+        update_per_step=0.1, episode_per_test=100, batch_size=64,
+        train_fn=lambda epoch, env_step: policy.set_eps(0.1),
+        test_fn=lambda epoch, env_step: policy.set_eps(0.05),
+        stop_fn=lambda mean_rewards: mean_rewards >= env.spec.reward_threshold)
     print(f'Finished training! Use {result["duration"]}')
 
-The meaning of each parameter is as follows:
+The meaning of each parameter is as follows (full description can be found at :func:`~tianshou.trainer.offpolicy_trainer`):
 
 * ``max_epoch``: The maximum of epochs for training. The training process might be finished before reaching the ``max_epoch``;
-* ``step_per_epoch``: The number of step for updating policy network in one epoch;
-* ``collect_per_step``: The number of frames the collector would collect before the network update. For example, the code above means "collect 10 frames and do one policy network update";
+* ``step_per_epoch``: The number of environment step (a.k.a. transition) collected per epoch;
+* ``step_per_collect``: The number of transition the collector would collect before the network update. For example, the code above means "collect 10 transitions and do one policy network update";
 * ``episode_per_test``: The number of episodes for one policy evaluation.
 * ``batch_size``: The batch size of sample data, which is going to feed in the policy network.
-* ``train_fn``: A function receives the current number of epoch index and performs some operations at the beginning of training in this epoch. For example, the code above means "reset the epsilon to 0.1 in DQN before training".
-* ``test_fn``: A function receives the current number of epoch index and performs some operations at the beginning of testing in this epoch. For example, the code above means "reset the epsilon to 0.05 in DQN before testing".
+* ``train_fn``: A function receives the current number of epoch and step index, and performs some operations at the beginning of training in this epoch. For example, the code above means "reset the epsilon to 0.1 in DQN before training".
+* ``test_fn``: A function receives the current number of epoch and step index, and performs some operations at the beginning of testing in this epoch. For example, the code above means "reset the epsilon to 0.05 in DQN before testing".
 * ``stop_fn``: A function receives the average undiscounted returns of the testing result, return a boolean which indicates whether reaching the goal.
-* ``writer``: See below.
+* ``logger``: See below.
 
 The trainer supports `TensorBoard <https://www.tensorflow.org/tensorboard>`_ for logging. It can be used as:
 ::
 
     from torch.utils.tensorboard import SummaryWriter
+    from tianshou.utils import BasicLogger
     writer = SummaryWriter('log/dqn')
+    logger = BasicLogger(writer)
 
-Pass the writer into the trainer, and the training result will be recorded into the TensorBoard.
+Pass the logger into the trainer, and the training result will be recorded into the TensorBoard.
 
 The returned result is a dictionary as follows:
 ::
@@ -160,7 +177,7 @@ It shows that within approximately 4 seconds, we finished training a DQN agent o
 Save/Load Policy
 ----------------
 
-Since the policy inherits the ``torch.nn.Module`` class, saving and loading the policy are exactly the same as a torch module:
+Since the policy inherits the class ``torch.nn.Module``, saving and loading the policy are exactly the same as a torch module:
 ::
 
     torch.save(policy.state_dict(), 'dqn.pth')
@@ -173,9 +190,10 @@ Watch the Agent's Performance
 :class:`~tianshou.data.Collector` supports rendering. Here is the example of watching the agent's performance in 35 FPS:
 ::
 
-    collector = ts.data.Collector(policy, env)
+    policy.eval()
+    policy.set_eps(0.05)
+    collector = ts.data.Collector(policy, env, exploration_noise=True)
     collector.collect(n_episode=1, render=1 / 35)
-    collector.close()
 
 
 .. _customized_trainer:
@@ -185,12 +203,11 @@ Train a Policy with Customized Codes
 
 "I don't want to use your provided trainer. I want to customize it!"
 
-No problem! Tianshou supports user-defined training code. Here is the usage:
+Tianshou supports user-defined training code. Here is the code snippet:
 ::
 
-    # pre-collect 5000 frames with random action before training
-    policy.set_eps(1)
-    train_collector.collect(n_step=5000)
+    # pre-collect at least 5000 transitions with random action before training
+    train_collector.collect(n_step=5000, random=True)
 
     policy.set_eps(0.1)
     for i in range(int(1e6)):  # total step
@@ -198,20 +215,20 @@ No problem! Tianshou supports user-defined training code. Here is the usage:
 
         # once if the collected episodes' mean returns reach the threshold,
         # or every 1000 steps, we test it on test_collector
-        if collect_result['rew'] >= env.spec.reward_threshold or i % 1000 == 0:
+        if collect_result['rews'].mean() >= env.spec.reward_threshold or i % 1000 == 0:
             policy.set_eps(0.05)
             result = test_collector.collect(n_episode=100)
-            if result['rew'] >= env.spec.reward_threshold:
-                print(f'Finished training! Test mean returns: {result["rew"]}')
+            if result['rews'].mean() >= env.spec.reward_threshold:
+                print(f'Finished training! Test mean returns: {result["rews"].mean()}')
                 break
             else:
                 # back to training eps
                 policy.set_eps(0.1)
 
-        # train policy with a sampled batch data
-        losses = policy.learn(train_collector.sample(batch_size=64))
+        # train policy with a sampled batch data from buffer
+        losses = policy.update(64, train_collector.buffer)
 
-For further usage, you can refer to :doc:`/tutorials/cheatsheet`.
+For further usage, you can refer to the :doc:`/tutorials/cheatsheet`.
 
 .. rubric:: References
 
