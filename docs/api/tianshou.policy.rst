@@ -35,6 +35,11 @@ DQN Family
    :undoc-members:
    :show-inheritance:
 
+.. autoclass:: tianshou.policy.IQNPolicy
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
 On-policy
 ~~~~~~~~~
 
@@ -95,6 +100,16 @@ Imitation
    :show-inheritance:
 
 .. autoclass:: tianshou.policy.DiscreteBCQPolicy
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+.. autoclass:: tianshou.policy.DiscreteCQLPolicy
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+.. autoclass:: tianshou.policy.DiscreteCRRPolicy
    :members:
    :undoc-members:
    :show-inheritance:
